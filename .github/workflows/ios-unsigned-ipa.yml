@@ -1,0 +1,102 @@
+# 把本文件放到 fork 仓库的 .github/workflows/ios-unsigned-ipa.yml
+# 在 Actions 页手动运行，构建完成后从 Artifacts 下载 STV-1.5-unsigned.ipa（未签名，需自签安装）。
+#
+# 为什么默认用 xcode-27 而不是 macos-15：
+#   project.yml 依赖 AetherEngine（播放内核），其 7.62.0 的 README 要求 Xcode 27 / Swift 6.4，
+#   且写明 "Older toolchains are not supported"；macos-15 镜像只有 Xcode 16.x 与 26.x。
+#   xcode-27 是 GitHub 2026-10 新增的 arm64 runner 标签，公共仓库可免费使用。
+#   标准 xcode-27 为 3 核 M1 / 7GB 内存，编译 FFmpeg + TDLib 可能内存吃紧，
+#   失败时改用 xcode-27-xlarge（更大规格 runner，需 Team/Enterprise 计划）。
+#   若必须试 macos-15：手动运行时 runner 选 macos-15、xcode 填 Xcode_26.3（best-effort，可能失败）。
+
+name: Build iDuanJu iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "GitHub 托管 runner 标签"
+        type: choice
+        default: xcode-27
+        options:
+          - xcode-27
+          - xcode-27-xlarge
+          - macos-15
+          - macos-15-xlarge
+      xcode:
+        description: "Xcode.app 名称，留空则用 runner 默认（macos-15 建议填 Xcode_26.3）"
+        type: string
+        default: ""
+      pin_engine:
+        description: "把 AetherEngine 固定到作者验证过的 7.62.0"
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'xcode-27' }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode and print toolchain
+        run: |
+          if [ -n "${{ inputs.xcode }}" ]; then
+            sudo xcode-select -s "/Applications/${{ inputs.xcode }}.app/Contents/Developer"
+          fi
+          ls -1 /Applications | grep -i '^Xcode' || true
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+
+      # project.yml 用的是 "from: 7.62.0"，SwiftPM 会解析到最新的 7.66.0，
+      # 与本项目实际验证过的版本不一致。改成 exactVersion 固定到 7.62.0。
+      - name: Pin AetherEngine to 7.62.0
+        if: ${{ inputs.pin_engine || github.event_name == 'push' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("project.yml")
+          s = p.read_text()
+          old = "    from: 7.62.0"
+          assert old in s, "project.yml 里没找到 'from: 7.62.0'，上游可能已改动，请人工检查"
+          p.write_text(s.replace(old, "    exactVersion: 7.62.0"))
+          print("AetherEngine pinned to 7.62.0")
+          PY
+          grep -n -A3 'AetherEngine:' project.yml
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Resolve Swift packages
+        run: xcodebuild -resolvePackageDependencies -project STV.xcodeproj -scheme STV
+
+      # scripts/package.sh 用 CODE_SIGNING_ALLOWED=NO 产出未签名 IPA + 模拟器 .app.zip
+      - name: Build unsigned IPA
+        run: |
+          bash scripts/package.sh "$PWD/dist" || {
+            echo "---- iphoneos build log ----";   tail -n 200 /tmp/stv-package-ios.log || true
+            echo "---- simulator build log ----";  tail -n 200 /tmp/stv-package-sim.log || true
+            exit 1
+          }
+          shasum -a 256 dist/*.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: iDuanJu-unsigned-ipa-${{ github.run_number }}
+          path: |
+            dist/*.ipa
+            dist/*simulator.app.zip
+          if-no-files-found: error
+          retention-days: 14
